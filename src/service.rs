@@ -12,6 +12,32 @@ use crate::users_store::UsersStore;
 
 pub use crate::sessions_store::EmbeddingConfig;
 
+const LOGOS_SCHEME: &str = "logos://";
+const MEM_SCHEME: &str = "mem://";
+
+#[derive(Debug, Clone, Copy)]
+enum Namespace {
+    Users,
+}
+
+fn resolve_namespace(path: &str) -> Result<Namespace, VfsError> {
+    let after_scheme = path
+        .strip_prefix(LOGOS_SCHEME)
+        .or_else(|| path.strip_prefix(MEM_SCHEME))
+        .ok_or_else(|| {
+            VfsError::InvalidPath(format!(
+                "path must start with \"{LOGOS_SCHEME}\" or \"{MEM_SCHEME}\""
+            ))
+        })?;
+
+    match after_scheme.split('/').next().unwrap_or("") {
+        "users" => Ok(Namespace::Users),
+        other => Err(VfsError::InvalidPath(format!(
+            "unsupported namespace: \"{other}\""
+        ))),
+    }
+}
+
 pub struct MemoryVfsService {
     users: UsersStore,
     sessions: SessionsStore,
@@ -85,7 +111,11 @@ impl MemoryVfs for MemoryVfsService {
         let started_at = Instant::now();
         let req = request.into_inner();
         let detail = format!("path={}", req.path);
-        match self.users.read(&req.path).await {
+        let result = match resolve_namespace(&req.path) {
+            Ok(Namespace::Users) => self.users.read(&req.path).await,
+            Err(e) => Err(e),
+        };
+        match result {
             Ok(content) => {
                 log_vfs_ok("read", &detail, started_at);
                 Ok(Response::new(ReadResponse {
@@ -112,7 +142,11 @@ impl MemoryVfs for MemoryVfsService {
         let started_at = Instant::now();
         let req = request.into_inner();
         let detail = format!("path={} content_len={}", req.path, req.content.len());
-        match self.users.write(&req.path, &req.content).await {
+        let result = match resolve_namespace(&req.path) {
+            Ok(Namespace::Users) => self.users.write(&req.path, &req.content).await,
+            Err(e) => Err(e),
+        };
+        match result {
             Ok(_) => {
                 log_vfs_ok("write", &detail, started_at);
                 Ok(Response::new(WriteResponse {
@@ -141,7 +175,11 @@ impl MemoryVfs for MemoryVfsService {
             req.path,
             req.partial_content.len()
         );
-        match self.users.patch(&req.path, &req.partial_content).await {
+        let result = match resolve_namespace(&req.path) {
+            Ok(Namespace::Users) => self.users.patch(&req.path, &req.partial_content).await,
+            Err(e) => Err(e),
+        };
+        match result {
             Ok(_) => {
                 log_vfs_ok("patch", &detail, started_at);
                 Ok(Response::new(PatchResponse {
