@@ -9,9 +9,8 @@ use tokio::sync::Mutex;
 
 use crate::service::VfsError;
 
-const MEM_SCHEME_PREFIX: &str = "mem://";
-const ROOT_USERS: &str = "users";
-const ROOT_CHATS: &str = "chats";
+const LOGOS_SCHEME: &str = "logos://";
+const MEM_SCHEME: &str = "mem://";
 
 pub struct UsersStore {
     users_root: PathBuf,
@@ -21,7 +20,7 @@ pub struct UsersStore {
 #[derive(Debug, Clone)]
 struct UsersFilePath {
     user_id: String,
-    file_name: String,
+    relative_path: String,
 }
 
 impl UsersStore {
@@ -39,7 +38,7 @@ impl UsersStore {
 
     pub async fn read(&self, raw_path: &str) -> Result<String, VfsError> {
         let path = parse_users_file_path(raw_path)?;
-        let file_path = self.physical_user_file_path(&path);
+        let file_path = self.physical_path(&path);
         let content = fs::read_to_string(&file_path).await.map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
                 VfsError::NotFound(format!("file not found: {}", file_path.display()))
@@ -47,51 +46,62 @@ impl UsersStore {
             _ => VfsError::Io(format!("failed to read {}: {e}", file_path.display())),
         })?;
 
-        let value: Value = serde_json::from_str(&content).map_err(|e| {
-            VfsError::InvalidJson(format!(
-                "invalid json in {}: {e}",
-                file_path.display()
-            ))
-        })?;
-        serde_json::to_string(&value)
-            .map_err(|e| VfsError::InvalidJson(format!("failed to serialize json: {e}")))
+        if is_json_path(&path.relative_path) {
+            let value: Value = serde_json::from_str(&content).map_err(|e| {
+                VfsError::InvalidJson(format!("invalid json in {}: {e}", file_path.display()))
+            })?;
+            serde_json::to_string(&value)
+                .map_err(|e| VfsError::InvalidJson(format!("failed to serialize json: {e}")))
+        } else {
+            Ok(content)
+        }
     }
 
     pub async fn write(&self, raw_path: &str, content: &str) -> Result<(), VfsError> {
         let path = parse_users_file_path(raw_path)?;
-        let parsed = parse_json_object(content)?;
-        let file_path = self.physical_user_file_path(&path);
-        self.ensure_user_dir_initialized(&path.user_id).await?;
+        let file_path = self.physical_path(&path);
 
         let file_lock = self.get_or_create_file_lock(&file_path).await;
         let _guard = file_lock.lock().await;
-        atomic_write_json(&file_path, &parsed).await?;
-        Ok(())
+
+        if is_json_path(&path.relative_path) {
+            let parsed = parse_json_object(content)?;
+            atomic_write_json(&file_path, &parsed).await
+        } else {
+            atomic_write(&file_path, content).await
+        }
     }
 
     pub async fn patch(&self, raw_path: &str, partial_content: &str) -> Result<(), VfsError> {
         let path = parse_users_file_path(raw_path)?;
+        if !is_json_path(&path.relative_path) {
+            return Err(VfsError::InvalidRequest(
+                "patch is only supported for .json files".to_string(),
+            ));
+        }
+
         let patch = parse_json_object(partial_content)?;
-        let file_path = self.physical_user_file_path(&path);
-        self.ensure_user_dir_initialized(&path.user_id).await?;
+        let file_path = self.physical_path(&path);
 
         let file_lock = self.get_or_create_file_lock(&file_path).await;
         let _guard = file_lock.lock().await;
 
-        let current_content = fs::read_to_string(&file_path).await.map_err(|e| {
-            VfsError::Io(format!(
-                "failed to read current json for patch {}: {e}",
-                file_path.display()
-            ))
-        })?;
-        let mut current = parse_json_object(&current_content)?;
+        let mut current = match fs::read_to_string(&file_path).await {
+            Ok(content) => parse_json_object(&content)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Object(Map::new()),
+            Err(e) => {
+                return Err(VfsError::Io(format!(
+                    "failed to read current json for patch {}: {e}",
+                    file_path.display()
+                )))
+            }
+        };
         merge_json_object(&mut current, &patch);
-        atomic_write_json(&file_path, &current).await?;
-        Ok(())
+        atomic_write_json(&file_path, &current).await
     }
 
-    fn physical_user_file_path(&self, path: &UsersFilePath) -> PathBuf {
-        self.users_root.join(&path.user_id).join(&path.file_name)
+    fn physical_path(&self, path: &UsersFilePath) -> PathBuf {
+        self.users_root.join(&path.user_id).join(&path.relative_path)
     }
 
     async fn get_or_create_file_lock(&self, file_path: &Path) -> Arc<Mutex<()>> {
@@ -101,70 +111,55 @@ impl UsersStore {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
-
-    async fn ensure_user_dir_initialized(&self, user_id: &str) -> Result<(), VfsError> {
-        let user_dir = self.users_root.join(user_id);
-        fs::create_dir_all(&user_dir).await.map_err(|e| {
-            VfsError::Io(format!(
-                "failed to create user directory {}: {e}",
-                user_dir.display()
-            ))
-        })?;
-
-        for file_name in valid_user_file_names() {
-            let file_path = user_dir.join(file_name);
-            if fs::metadata(&file_path).await.is_err() {
-                atomic_write_json(&file_path, &Value::Object(Map::new())).await?;
-            }
-        }
-        Ok(())
-    }
 }
 
 fn parse_users_file_path(raw_path: &str) -> Result<UsersFilePath, VfsError> {
-    if !raw_path.starts_with(MEM_SCHEME_PREFIX) {
-        return Err(VfsError::InvalidPath(format!(
-            "path must start with {MEM_SCHEME_PREFIX}"
-        )));
-    }
+    let after_scheme = raw_path
+        .strip_prefix(LOGOS_SCHEME)
+        .or_else(|| raw_path.strip_prefix(MEM_SCHEME))
+        .ok_or_else(|| {
+            VfsError::InvalidPath(format!(
+                "path must start with \"{LOGOS_SCHEME}\" or \"{MEM_SCHEME}\""
+            ))
+        })?;
 
-    let path = &raw_path[MEM_SCHEME_PREFIX.len()..];
-    let segments: Vec<&str> = path.split('/').collect();
-    if segments.len() != 3 {
+    let segments: Vec<&str> = after_scheme.split('/').collect();
+    if segments.len() < 3 {
         return Err(VfsError::InvalidPath(
-            "path must match mem://users/{user_id}/{file_name}".to_string(),
+            "path must match logos://users/{user_id}/{...path}".to_string(),
         ));
     }
 
-    match segments[0] {
-        ROOT_USERS => {}
-        ROOT_CHATS => {
-            return Err(VfsError::InvalidPath(
-                "chats root is not supported by read/write/patch".to_string(),
-            ))
-        }
-        _ => {
-            return Err(VfsError::InvalidPath(
-                "only users root is currently supported".to_string(),
-            ))
-        }
-    }
-
-    if segments[1].is_empty() {
-        return Err(VfsError::InvalidPath("user_id cannot be empty".to_string()));
-    }
-
-    let file_name = segments[2];
-    if !valid_user_file_names().contains(&file_name) {
+    if segments[0] != "users" {
         return Err(VfsError::InvalidPath(format!(
-            "unsupported users file: {file_name}"
+            "expected namespace \"users\", got \"{}\"",
+            segments[0]
         )));
     }
 
+    let user_id = segments[1];
+    if user_id.is_empty() {
+        return Err(VfsError::InvalidPath("user_id cannot be empty".to_string()));
+    }
+
+    for seg in &segments[2..] {
+        if *seg == ".." || seg.is_empty() {
+            return Err(VfsError::InvalidPath(
+                "path contains invalid segment".to_string(),
+            ));
+        }
+    }
+
+    let relative_path = segments[2..].join("/");
+
     Ok(UsersFilePath {
-        user_id: segments[1].to_string(),
-        file_name: file_name.to_string(),
+        user_id: user_id.to_string(),
+        relative_path,
     })
+}
+
+fn is_json_path(path: &str) -> bool {
+    path.ends_with(".json")
 }
 
 fn parse_json_object(content: &str) -> Result<Value, VfsError> {
@@ -198,7 +193,7 @@ fn merge_json_object(target: &mut Value, patch: &Value) {
     }
 }
 
-async fn atomic_write_json(target: &Path, value: &Value) -> Result<(), VfsError> {
+async fn atomic_write(target: &Path, content: &str) -> Result<(), VfsError> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).await.map_err(|e| {
             VfsError::Io(format!(
@@ -207,9 +202,6 @@ async fn atomic_write_json(target: &Path, value: &Value) -> Result<(), VfsError>
             ))
         })?;
     }
-
-    let content = serde_json::to_string_pretty(value)
-        .map_err(|e| VfsError::InvalidJson(format!("failed to serialize json: {e}")))?;
 
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -234,6 +226,8 @@ async fn atomic_write_json(target: &Path, value: &Value) -> Result<(), VfsError>
     Ok(())
 }
 
-fn valid_user_file_names() -> [&'static str; 3] {
-    ["preferences.json", "tech_projects.json", "relations.json"]
+async fn atomic_write_json(target: &Path, value: &Value) -> Result<(), VfsError> {
+    let content = serde_json::to_string_pretty(value)
+        .map_err(|e| VfsError::InvalidJson(format!("failed to serialize json: {e}")))?;
+    atomic_write(target, &content).await
 }
