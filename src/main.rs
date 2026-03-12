@@ -1,3 +1,4 @@
+mod memory_store;
 mod service;
 mod sessions_store;
 mod users_store;
@@ -18,17 +19,19 @@ pub mod pb {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen = resolve_listen_target();
     let users_root = resolve_users_root();
+    let memory_root = resolve_memory_root();
     let embedding = resolve_embedding_config();
-    let service = MemoryVfsService::new(users_root.clone(), embedding)?;
+    let service = MemoryVfsService::new(users_root.clone(), memory_root.clone(), embedding)?;
     let grpc_service = pb::memory_vfs_server::MemoryVfsServer::new(service);
 
     if let Some(socket_path) = parse_uds_path(&listen) {
         prepare_unix_socket(&socket_path)?;
         let listener = UnixListener::bind(&socket_path)?;
         println!(
-            "memory-vfs listening on unix://{}, users root: {}",
+            "memory-vfs listening on unix://{}, users root: {}, memory root: {}",
             socket_path.display(),
-            users_root.display()
+            users_root.display(),
+            memory_root.display()
         );
         Server::builder()
             .add_service(grpc_service)
@@ -36,7 +39,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
     } else {
         let addr: SocketAddr = listen.parse()?;
-        println!("memory-vfs listening on {addr}, users root: {}", users_root.display());
+        println!(
+            "memory-vfs listening on {addr}, users root: {}, memory root: {}",
+            users_root.display(),
+            memory_root.display()
+        );
         Server::builder().add_service(grpc_service).serve(addr).await?;
     }
 
@@ -81,6 +88,13 @@ fn resolve_users_root() -> PathBuf {
     }
 
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/state/entities")
+}
+
+fn resolve_memory_root() -> PathBuf {
+    if let Ok(path) = std::env::var("VFS_MEMORY_ROOT") {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/state/memory")
 }
 
 fn resolve_embedding_config() -> EmbeddingConfig {

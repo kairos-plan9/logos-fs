@@ -16,6 +16,7 @@ arrow-array = "57"
 arrow-schema = "57"
 futures-util = "0.3"
 lancedb = "0.26"
+rusqlite = { version = "0.38.0", features = ["bundled"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"
