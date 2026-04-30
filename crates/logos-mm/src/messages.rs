@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use logos_vfs::VfsError;
 
@@ -18,7 +18,7 @@ const FTS_MAX_LIMIT: i64 = 50;
 /// Schema follows RFC 003 §2.1.
 pub struct MessageDb {
     db_root: PathBuf,
-    pools: Mutex<HashMap<String, SqlitePool>>,
+    pools: RwLock<HashMap<String, SqlitePool>>,
 }
 
 impl MessageDb {
@@ -27,16 +27,19 @@ impl MessageDb {
             .map_err(|e| VfsError::Io(format!("create memory dir: {e}")))?;
         Ok(Self {
             db_root,
-            pools: Mutex::new(HashMap::new()),
+            pools: RwLock::new(HashMap::new()),
         })
     }
 
     /// Get or create a connection pool for a chat_id.
     pub(crate) async fn pool(&self, chat_id: &str) -> Result<SqlitePool, VfsError> {
-        let mut map = self.pools.lock().await;
-        if let Some(p) = map.get(chat_id) {
-            return Ok(p.clone());
+        {
+            let map = self.pools.read().await;
+            if let Some(p) = map.get(chat_id) {
+                return Ok(p.clone());
+            }
         }
+
         let db_path = self.db_root.join(format!("{chat_id}.db"));
         let url = format!("sqlite:{}?mode=rwc", db_path.display());
         let pool = SqlitePoolOptions::new()
@@ -45,6 +48,11 @@ impl MessageDb {
             .await
             .map_err(|e| VfsError::Sqlite(format!("open {}: {e}", db_path.display())))?;
         init_schema(&pool).await?;
+
+        let mut map = self.pools.write().await;
+        if let Some(existing) = map.get(chat_id) {
+            return Ok(existing.clone());
+        }
         map.insert(chat_id.to_string(), pool.clone());
         Ok(pool)
     }
@@ -52,7 +60,7 @@ impl MessageDb {
     /// Insert a message. Returns the new msg_id.
     ///
     /// `content` is a JSON object with fields:
-    /// `ts`, `chat_id`, `speaker`, `reply_to` (msg_id integer), `text`, `mentions`
+    /// `ts`, `chat_id`, `actor_id|speaker`, `reply_to` (msg_id integer), `text`, `mentions`
     ///
     /// RFC 003 §2.1
     pub async fn insert(&self, chat_id: &str, content: &str) -> Result<i64, VfsError> {
@@ -62,19 +70,27 @@ impl MessageDb {
 
         let now = now_iso8601();
         let ts = val["ts"].as_str().unwrap_or(&now).to_string();
-        let speaker = val["speaker"].as_str().unwrap_or_default().to_string();
+        let speaker = val["actor_id"]
+            .as_str()
+            .or_else(|| val["speaker"].as_str())
+            .unwrap_or_default()
+            .to_string();
         let text = val["text"].as_str().unwrap_or_default().to_string();
         let mentions = val["mentions"]
             .as_array()
             .map(|a| serde_json::to_string(a).unwrap_or_else(|_| "[]".to_string()))
             .unwrap_or_else(|| "[]".to_string());
+        let meta = val
+            .get("meta")
+            .filter(|meta| !meta.is_null())
+            .map(|meta| serde_json::to_string(meta).unwrap_or_else(|_| "null".to_string()));
         let reply_to: Option<i64> = val["reply_to"].as_i64();
 
         let user_msg_id: Option<i64> = val["msg_id"].as_i64();
 
         let result = sqlx::query(
-            "INSERT INTO messages (msg_id, ts, chat_id, speaker, reply_to, text, mentions)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO messages (msg_id, ts, chat_id, speaker, reply_to, text, mentions, meta)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .bind(user_msg_id)
         .bind(&ts)
@@ -83,6 +99,7 @@ impl MessageDb {
         .bind(reply_to)
         .bind(&text)
         .bind(&mentions)
+        .bind(meta)
         .execute(&pool)
         .await
         .map_err(|e| VfsError::Sqlite(format!("insert: {e}")))?;
@@ -104,7 +121,7 @@ impl MessageDb {
     pub async fn get_by_id(&self, chat_id: &str, msg_id: i64) -> Result<Option<String>, VfsError> {
         let pool = self.pool(chat_id).await?;
         let row = sqlx::query(
-            "SELECT msg_id, ts, chat_id, speaker, reply_to, text, mentions
+            "SELECT msg_id, ts, chat_id, speaker, reply_to, text, mentions, meta
              FROM messages WHERE msg_id = ?1",
         )
         .bind(msg_id)
@@ -131,7 +148,7 @@ impl MessageDb {
         let escaped = format!("\"{}\"", query.replace('"', "\"\""));
 
         let rows = sqlx::query(
-            "SELECT m.msg_id, m.ts, m.chat_id, m.speaker, m.reply_to, m.text, m.mentions
+            "SELECT m.msg_id, m.ts, m.chat_id, m.speaker, m.reply_to, m.text, m.mentions, m.meta
              FROM messages_fts f
              JOIN messages m ON m.msg_id = f.rowid
              WHERE messages_fts MATCH ?1
@@ -179,7 +196,7 @@ impl MessageDb {
             .map(|(s, e)| format!("(msg_id >= {s} AND msg_id <= {e})"))
             .collect();
         let sql = format!(
-            "SELECT msg_id, ts, chat_id, speaker, reply_to, text, mentions
+            "SELECT msg_id, ts, chat_id, speaker, reply_to, text, mentions, meta
              FROM messages WHERE ({}) ORDER BY msg_id ASC LIMIT {} OFFSET {}",
             where_clauses.join(" OR "),
             limit,
@@ -202,10 +219,12 @@ fn msg_row_to_json(row: &sqlx::sqlite::SqliteRow) -> serde_json::Value {
         "msg_id": row.get::<i64, _>("msg_id"),
         "ts": row.get::<String, _>("ts"),
         "chat_id": row.get::<String, _>("chat_id"),
+        "actor_id": row.get::<String, _>("speaker"),
         "speaker": row.get::<String, _>("speaker"),
         "reply_to": row.get::<Option<i64>, _>("reply_to"),
         "text": row.get::<String, _>("text"),
         "mentions": row.get::<String, _>("mentions"),
+        "meta": parse_json_column(row.get::<Option<String>, _>("meta")),
     })
 }
 
@@ -219,12 +238,26 @@ async fn init_schema(pool: &SqlitePool) -> Result<(), VfsError> {
             speaker   TEXT NOT NULL,
             reply_to  INTEGER,
             text      TEXT NOT NULL,
-            mentions  TEXT
+            mentions  TEXT,
+            meta      TEXT
         )",
     )
     .execute(pool)
     .await
     .map_err(|e| VfsError::Sqlite(format!("init messages schema: {e}")))?;
+
+    match sqlx::query("ALTER TABLE messages ADD COLUMN meta TEXT")
+        .execute(pool)
+        .await
+    {
+        Ok(_) => {}
+        Err(error) => {
+            let message = error.to_string();
+            if !message.contains("duplicate column name: meta") {
+                return Err(VfsError::Sqlite(format!("alter messages schema: {message}")));
+            }
+        }
+    }
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, ts)")
         .execute(pool)
@@ -248,4 +281,15 @@ async fn init_schema(pool: &SqlitePool) -> Result<(), VfsError> {
 
 pub(crate) fn now_iso8601() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+fn parse_json_column(value: Option<String>) -> serde_json::Value {
+    let Some(raw) = value else {
+        return serde_json::Value::Null;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return serde_json::Value::Null;
+    }
+    serde_json::from_str(trimmed).unwrap_or(serde_json::Value::Null)
 }

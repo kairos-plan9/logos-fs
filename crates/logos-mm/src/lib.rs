@@ -42,6 +42,8 @@ impl MemoryModule {
     pub fn init(db_root: PathBuf, sessions: Arc<SessionStore>) -> Result<Self, VfsError> {
         let messages = MessageDb::new(db_root)?;
         let mut view_map: HashMap<String, Box<dyn views::MemoryView>> = HashMap::new();
+        let by_actor = views::ByActorView;
+        view_map.insert(by_actor.name().to_string(), Box::new(by_actor));
         let by_speaker = views::BySpeakerView;
         view_map.insert(by_speaker.name().to_string(), Box::new(by_speaker));
         let recent = views::RecentView;
@@ -183,7 +185,11 @@ impl Namespace for MemoryModule {
                     chat_id: gid.to_string(),
                     reply_to: val["reply_to"].as_i64(),
                     text: val["text"].as_str().unwrap_or_default().to_string(),
-                    speaker: val["speaker"].as_str().unwrap_or_default().to_string(),
+                    speaker: val["actor_id"]
+                        .as_str()
+                        .or_else(|| val["speaker"].as_str())
+                        .unwrap_or_default()
+                        .to_string(),
                     ts: val["ts"].as_str().unwrap_or_default().to_string(),
                 };
                 self.sessions.observe(msg_ref).await;
@@ -241,13 +247,17 @@ mod tests {
     #[tokio::test]
     async fn insert_and_get_message() {
         let (mm, _dir) = test_mm().await;
-        let msg = r#"{"ts":"2026-03-20T10:00:00Z","speaker":"alice","text":"hello","reply_to":null}"#;
+        let msg = r#"{"ts":"2026-03-20T10:00:00Z","actor_id":"alice","text":"hello","reply_to":null,"meta":{"username":"Alice","senderEntityType":"user","replyToUserId":"bob"}}"#;
         mm.write(&["groups", "chat-1", "messages"], msg).await.unwrap();
 
         let result = mm.read(&["groups", "chat-1", "messages", "1"]).await.unwrap();
         let val: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(val["actor_id"], "alice");
         assert_eq!(val["speaker"], "alice");
         assert_eq!(val["text"], "hello");
+        assert_eq!(val["meta"]["username"], "Alice");
+        assert_eq!(val["meta"]["senderEntityType"], "user");
+        assert_eq!(val["meta"]["replyToUserId"], "bob");
     }
 
     #[tokio::test]
@@ -365,5 +375,22 @@ mod tests {
         ).await.unwrap();
         assert!(result.contains("alice"));
         assert!(!result.contains("bob"));
+    }
+
+    #[tokio::test]
+    async fn view_by_actor() {
+        let (mm, _dir) = test_mm().await;
+        mm.write(&["groups", "chat-1", "messages"],
+            r#"{"ts":"2026-03-20T10:00:00Z","actor_id":"user:1","speaker":"alice","text":"hello from alice"}"#
+        ).await.unwrap();
+        mm.write(&["groups", "chat-1", "messages"],
+            r#"{"ts":"2026-03-20T10:01:00Z","actor_id":"user:2","speaker":"bob","text":"hello from bob"}"#
+        ).await.unwrap();
+
+        let result = mm.handle_call("memory.view.by_actor",
+            r#"{"chat_id":"chat-1","actor_id":"user:1","limit":10}"#
+        ).await.unwrap();
+        assert!(result.contains("user:1"));
+        assert!(!result.contains("user:2"));
     }
 }
