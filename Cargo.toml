@@ -4,6 +4,7 @@ members = [
     "crates/logos-vfs",
     "crates/logos-mm",
     "crates/logos-session",
+    "crates/logos-session-ns",
     "crates/logos-system",
     "crates/logos-kernel",
     "crates/logos-mcp",

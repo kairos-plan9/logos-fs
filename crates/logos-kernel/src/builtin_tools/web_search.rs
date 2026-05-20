@@ -173,7 +173,7 @@ fn parse_ddg_html(html: &str, max: usize) -> Vec<SearchResult> {
             match (s_content_start, s_end) {
                 (Some(sc), Some(se)) => {
                     pos = se;
-                    truncate(&strip_html_tags(&html[sc..se]), 200)
+                    truncate(&strip_html_tags(&html[sc..se]), 500)
                 }
                 _ => String::new(),
             }
@@ -258,7 +258,7 @@ async fn search_wikipedia(
                 source: "wiki",
                 url: format!("https://en.wikipedia.org/wiki/{page_title}"),
                 title,
-                snippet: truncate(&snippet, 200),
+                snippet: truncate(&snippet, 500),
             }
         })
         .collect())

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use logos_vfs::{Namespace, VfsError};
 
 use crate::proc::ProcTool;
+#[cfg(feature = "sandbox")]
 use crate::sandbox::SandboxNs;
 
 /// system.search_tasks — multi-level experience retrieval (RFC 003 §6.2)
@@ -39,12 +40,14 @@ impl ProcTool for SystemSearchTasksTool {
     }
 }
 
+#[cfg(feature = "chat")]
 /// system.get_context — auto-inject context for agent turn (RFC 003 §5.5)
 pub struct SystemGetContextTool {
     pub mm: Arc<logos_mm::MemoryModule>,
     pub sessions: Arc<logos_mm::SessionStore>,
 }
 
+#[cfg(feature = "chat")]
 #[async_trait]
 impl ProcTool for SystemGetContextTool {
     fn name(&self) -> &str {
@@ -101,6 +104,7 @@ impl ProcTool for SystemGetContextTool {
     }
 }
 
+#[cfg(feature = "sandbox")]
 /// system.complete — turn terminator (RFC 002 §9.1)
 ///
 /// Finishes, sleeps, or resumes a task. Optionally creates an anchor,
@@ -110,6 +114,7 @@ pub struct SystemCompleteTool {
     pub sandbox: Arc<SandboxNs>,
 }
 
+#[cfg(feature = "sandbox")]
 #[async_trait]
 impl ProcTool for SystemCompleteTool {
     fn name(&self) -> &str {

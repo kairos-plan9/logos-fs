@@ -25,6 +25,12 @@ service Logos {
   rpc Handshake(HandshakeReq) returns (HandshakeRes);
   rpc RegisterToken(RegisterTokenReq) returns (RegisterTokenRes);
   rpc RevokeToken(RevokeTokenReq) returns (RevokeTokenRes);
+
+  // Session lifecycle (TUI coding agent)
+  rpc CreateSession(CreateSessionReq) returns (CreateSessionRes);
+  rpc Checkpoint(CheckpointReq) returns (CheckpointRes);
+  rpc Rollback(RollbackReq) returns (RollbackRes);
+  rpc Fork(ForkReq) returns (ForkRes);
 }
 
 // --- Read / Write / Patch: URI-routed data operations ---
@@ -62,3 +68,36 @@ message RegisterTokenRes {}
 
 message RevokeTokenReq { string token = 1; }
 message RevokeTokenRes {}
+
+// --- Session lifecycle: JuiceFS-backed workspace management ---
+
+message CreateSessionReq {
+  string project_path = 1;
+  string session_id = 2;
+}
+message CreateSessionRes {
+  string session_id = 1;
+  string workspace_path = 2;
+}
+
+message CheckpointReq {
+  string session_id = 1;
+  string checkpoint_id = 2;
+}
+message CheckpointRes {
+  string checkpoint_id = 1;
+}
+
+message RollbackReq {
+  string session_id = 1;
+  string checkpoint_id = 2;
+}
+message RollbackRes {}
+
+message ForkReq {
+  string from_session_id = 1;
+  string new_session_id = 2;
+}
+message ForkRes {
+  string new_session_id = 1;
+}

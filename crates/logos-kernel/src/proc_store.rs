@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use logos_vfs::{Namespace, VfsError};
 
 use crate::proc::ProcTool;
+#[cfg(feature = "sandbox")]
 use crate::sandbox::SandboxNs;
 
 /// ProcStore namespace — `logos://proc-store/`.
@@ -22,6 +23,7 @@ impl ProcStoreNs {
         Ok(Self { root })
     }
 
+    #[cfg(feature = "sandbox")]
     /// Scan proc-store and create ExternalProcTool instances for each tool.
     ///
     /// For tools with a `git` field, clones/updates the repo in the system sandbox.
@@ -165,6 +167,7 @@ impl Namespace for ProcStoreNs {
     }
 }
 
+#[cfg(feature = "sandbox")]
 /// An external proc tool backed by a git project in the sandbox.
 ///
 /// Execution: writes params to stdin, runs the `run` command in the
@@ -176,6 +179,7 @@ struct ExternalProcTool {
     sandbox: Arc<SandboxNs>,
 }
 
+#[cfg(feature = "sandbox")]
 #[async_trait]
 impl ProcTool for ExternalProcTool {
     fn name(&self) -> &str {

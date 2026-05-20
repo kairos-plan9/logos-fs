@@ -4,6 +4,7 @@ use tonic::{Request, Response, Status};
 
 use crate::pb::logos_server::Logos;
 use crate::pb::*;
+#[cfg(feature = "sandbox")]
 use crate::sandbox::SandboxNs;
 use crate::token::TokenRegistry;
 use logos_vfs::{Namespace, RoutingTable, VfsError};
@@ -13,26 +14,40 @@ const SESSION_KEY_HEADER: &str = "x-logos-session";
 pub struct LogosService {
     table: Arc<RoutingTable>,
     system: Arc<logos_system::SystemModule>,
-    sandbox: Arc<SandboxNs>,
+    #[cfg(feature = "sandbox")]
+    sandbox: Option<Arc<SandboxNs>>,
     proc_ns: Arc<crate::proc::ProcNs>,
     tokens: Arc<TokenRegistry>,
+    session_ns: Option<Arc<logos_session_ns::SessionNs>>,
 }
 
 impl LogosService {
     pub fn new(
         table: Arc<RoutingTable>,
         system: Arc<logos_system::SystemModule>,
-        sandbox: Arc<SandboxNs>,
         proc_ns: Arc<crate::proc::ProcNs>,
         tokens: Arc<TokenRegistry>,
     ) -> Self {
         Self {
             table,
             system,
-            sandbox,
+            #[cfg(feature = "sandbox")]
+            sandbox: None,
             proc_ns,
             tokens,
+            session_ns: None,
         }
+    }
+
+    #[cfg(feature = "sandbox")]
+    pub fn with_sandbox(mut self, sandbox: Arc<SandboxNs>) -> Self {
+        self.sandbox = Some(sandbox);
+        self
+    }
+
+    pub fn with_session_ns(mut self, session_ns: Arc<logos_session_ns::SessionNs>) -> Self {
+        self.session_ns = Some(session_ns);
+        self
     }
 }
 
@@ -174,15 +189,32 @@ impl Logos for LogosService {
 
     async fn exec(&self, request: Request<ExecReq>) -> Result<Response<ExecRes>, Status> {
         let info = extract_session_info(&self.tokens, &request).await;
-        // No session = no exec (management interface doesn't need exec)
         let si = info.ok_or_else(|| Status::unauthenticated("exec requires a valid session"))?;
         let command = request.into_inner().command;
-        let result = self.sandbox.exec(&command, &si.agent_config_id, &si.task_id).await.map_err(vfs_to_status)?;
-        Ok(Response::new(ExecRes {
-            stdout: result.stdout,
-            stderr: result.stderr,
-            exit_code: result.exit_code,
-        }))
+
+        if let Some(ref sns) = self.session_ns {
+            let result = sns.exec(&si.task_id, &command).await.map_err(vfs_to_status)?;
+            return Ok(Response::new(ExecRes {
+                stdout: result.stdout,
+                stderr: result.stderr,
+                exit_code: result.exit_code,
+            }));
+        }
+
+        #[cfg(feature = "sandbox")]
+        {
+            let sandbox = self.sandbox.as_ref()
+                .ok_or_else(|| Status::unimplemented("sandbox not configured"))?;
+            let result = sandbox.exec(&command, &si.agent_config_id, &si.task_id).await.map_err(vfs_to_status)?;
+            return Ok(Response::new(ExecRes {
+                stdout: result.stdout,
+                stderr: result.stderr,
+                exit_code: result.exit_code,
+            }));
+        }
+
+        #[cfg(not(feature = "sandbox"))]
+        Err(Status::unimplemented("exec requires sandbox or session namespace"))
     }
 
     async fn call(&self, request: Request<CallReq>) -> Result<Response<CallRes>, Status> {
@@ -205,10 +237,12 @@ impl Logos for LogosService {
         let token = request.into_inner().token;
         match self.tokens.consume(&token).await {
             Some((session_key, task_id, agent_config_id)) => {
-                // Pre-create container + register task → agent mapping
+                #[cfg(feature = "sandbox")]
                 if !agent_config_id.is_empty() {
-                    if let Err(e) = self.sandbox.ensure_container_for(&agent_config_id, &task_id).await {
-                        eprintln!("[logos] WARNING: pre-create container failed for {agent_config_id}: {e}");
+                    if let Some(ref sandbox) = self.sandbox {
+                        if let Err(e) = sandbox.ensure_container_for(&agent_config_id, &task_id).await {
+                            eprintln!("[logos] WARNING: pre-create container failed for {agent_config_id}: {e}");
+                        }
                     }
                 }
 
@@ -252,6 +286,66 @@ impl Logos for LogosService {
         let token = request.into_inner().token;
         self.tokens.revoke(&token).await;
         Ok(Response::new(RevokeTokenRes {}))
+    }
+
+    async fn create_session(
+        &self,
+        request: Request<CreateSessionReq>,
+    ) -> Result<Response<CreateSessionRes>, Status> {
+        let req = request.into_inner();
+        let sns = self.session_ns.as_ref()
+            .ok_or_else(|| Status::unimplemented("session namespace not configured"))?;
+        sns.create_session(&req.project_path, &req.session_id)
+            .await
+            .map_err(vfs_to_status)?;
+        let workspace_path = format!("logos://session/{}/workspace", req.session_id);
+        Ok(Response::new(CreateSessionRes {
+            session_id: req.session_id,
+            workspace_path,
+        }))
+    }
+
+    async fn checkpoint(
+        &self,
+        request: Request<CheckpointReq>,
+    ) -> Result<Response<CheckpointRes>, Status> {
+        let req = request.into_inner();
+        let sns = self.session_ns.as_ref()
+            .ok_or_else(|| Status::unimplemented("session namespace not configured"))?;
+        sns.checkpoint(&req.session_id, &req.checkpoint_id)
+            .await
+            .map_err(vfs_to_status)?;
+        Ok(Response::new(CheckpointRes {
+            checkpoint_id: req.checkpoint_id,
+        }))
+    }
+
+    async fn rollback(
+        &self,
+        request: Request<RollbackReq>,
+    ) -> Result<Response<RollbackRes>, Status> {
+        let req = request.into_inner();
+        let sns = self.session_ns.as_ref()
+            .ok_or_else(|| Status::unimplemented("session namespace not configured"))?;
+        sns.rollback(&req.session_id, &req.checkpoint_id)
+            .await
+            .map_err(vfs_to_status)?;
+        Ok(Response::new(RollbackRes {}))
+    }
+
+    async fn fork(
+        &self,
+        request: Request<ForkReq>,
+    ) -> Result<Response<ForkRes>, Status> {
+        let req = request.into_inner();
+        let sns = self.session_ns.as_ref()
+            .ok_or_else(|| Status::unimplemented("session namespace not configured"))?;
+        sns.fork(&req.from_session_id, &req.new_session_id)
+            .await
+            .map_err(vfs_to_status)?;
+        Ok(Response::new(ForkRes {
+            new_session_id: req.new_session_id,
+        }))
     }
 }
 
